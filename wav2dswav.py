@@ -5,6 +5,7 @@ from pydub import AudioSegment
 from ttkthemes import ThemedTk
 from pathlib import Path
 from languages import translations
+import numpy as np
 
 def update_text(language):
     text_vars = {
@@ -18,6 +19,8 @@ def update_text(language):
         'prefix_label': prefix_label,
         'remove_prefixes_option': remove_prefixes_option,
         'prefix_count_label': prefix_count_label,
+        'volume_label': volume_label,
+        'volume_tooltip': volume_tooltip,
         'start_button': start_button,
         'no_files': no_files_message,
         'processing_done': processing_done_message,
@@ -35,10 +38,39 @@ def remove_n_prefixes(filename, count):
         return parts[-1]
     return filename
 
-def process_wav(filepath, output_folder, apply_fade, suffixes, prefixes, remove_prefixes, prefix_count):
+def apply_volume_adjustment(audio_segment, volume_db):
+    """Apply volume adjustment with soft clipping protection"""
+    if volume_db == 0:
+        return audio_segment
+    
+    samples = np.array(audio_segment.get_array_of_samples())
+    
+    gain = 10 ** (volume_db / 20)
+    samples = samples * gain
+    
+    def soft_clip(x):
+        threshold = 0.8
+        return np.where(x > threshold, 
+                       threshold + (1 - threshold) * np.tanh((x - threshold) / (1 - threshold)),
+                       np.where(x < -threshold, 
+                               -threshold + (1 - threshold) * np.tanh((x + threshold) / (1 - threshold)),
+                               x))
+    
+    if volume_db > 0:
+        max_sample = np.max(np.abs(samples))
+        if max_sample > 0.9:  # Only clip if we're close to clipping
+            samples = soft_clip(samples / 32768) * 32768
+    
+    return audio_segment._spawn(samples.astype(np.int16))
+
+def process_wav(filepath, output_folder, apply_fade, suffixes, prefixes, remove_prefixes, prefix_count, volume_db):
     try:
         audio = AudioSegment.from_wav(filepath)
         audio = audio.set_channels(1).set_sample_width(2)
+
+        # Apply volume adjustment
+        if volume_db != 0:
+            audio = apply_volume_adjustment(audio, volume_db)
 
         if apply_fade:
             fade_duration = min(len(audio), 150)
@@ -69,6 +101,7 @@ def process_wav(filepath, output_folder, apply_fade, suffixes, prefixes, remove_
 def start_gui():
     global header_label, folder_label, browse_button, fade_option, suffix_option, suffix_label
     global prefix_option, prefix_label, remove_prefixes_option, prefix_count_label, start_button
+    global volume_label, volume_tooltip
     global no_files_message, processing_done_message, choose_folder_message, error_processing_message
 
     root = ThemedTk()
@@ -80,6 +113,7 @@ def start_gui():
     suffix_input = tk.StringVar()
     prefix_input = tk.StringVar()
     prefix_count = tk.IntVar(value=1)
+    volume_db = tk.DoubleVar(value=0.0)
     apply_fade = tk.BooleanVar()
     apply_suffix_removal = tk.BooleanVar()
     apply_prefix_removal = tk.BooleanVar()
@@ -104,14 +138,17 @@ def start_gui():
         suffixes = [s.strip() for s in suffix_input.get().split(",")] if apply_suffix_removal.get() else []
         prefixes = [p.strip() for p in prefix_input.get().split(",")] if apply_prefix_removal.get() else []
         count = prefix_count.get() if remove_prefixes.get() else 0
+        volume = volume_db.get()
 
         output_folder = Path(folder) / "converted"
         output_folder.mkdir(exist_ok=True)
 
-        success_count = sum(process_wav(f, output_folder, apply_fade.get(), suffixes, prefixes, remove_prefixes.get(), count) for f in wav_files)
+        success_count = sum(process_wav(f, output_folder, apply_fade.get(), suffixes, prefixes, 
+                                      remove_prefixes.get(), count, volume) for f in wav_files)
 
         messagebox.showinfo("Done", f"{processing_done_message} {success_count}")
 
+    # Interface
     header_label = ttk.Label(root, text=translations['en']['header_text'], anchor="center", justify="center", font=("Segoe UI", 10))
     header_label.grid(row=0, column=0, columnspan=4, pady=(10, 15))
 
@@ -154,8 +191,44 @@ def start_gui():
     prefix_count_spinbox = ttk.Spinbox(root, from_=1, to=3, textvariable=prefix_count, width=5)
     prefix_count_spinbox.grid(row=8, column=1, sticky="w")
 
+    # Volume adjustment controls
+    volume_label = ttk.Label(root, text=translations['en']['volume_label'])
+    volume_label.grid(row=9, column=0, pady=5, sticky="w")
+
+    volume_slider = ttk.Scale(root, from_=-12, to=12, variable=volume_db, length=200)
+    volume_slider.grid(row=9, column=1, padx=5, sticky="w")
+
+    def validate_volume(new_val):
+        try:
+            val = float(new_val)
+            return -12 <= val <= 12
+        except ValueError:
+            return False
+        
+    validate_cmd = root.register(validate_volume)
+
+    volume_entry = ttk.Entry(
+        root, 
+        textvariable=volume_db, 
+        width=6,
+        validate='key',
+        validatecommand=(validate_cmd, '%P')
+    )
+    volume_entry.grid(row=9, column=2, padx=(0, 5), sticky="w")
+
+    def update_slider_from_entry(*args):
+        try:
+            volume_slider.set(float(volume_db.get()))
+        except:
+         pass
+
+    volume_db.trace_add('write', update_slider_from_entry)
+
+    volume_tooltip = ttk.Label(root, text=translations['en']['volume_tooltip'])
+    volume_tooltip.grid(row=10, column=0, columnspan=4, pady=(0, 10), sticky="w")
+
     start_button = ttk.Button(root, text=translations['en']['start_button'], command=start_conversion)
-    start_button.grid(row=10, column=0, columnspan=4, pady=10)
+    start_button.grid(row=12, column=0, columnspan=4, pady=10)
 
     no_files_message = translations['en']['no_files']
     processing_done_message = translations['en']['processing_done']
@@ -164,7 +237,7 @@ def start_gui():
 
     language_choice = ttk.Combobox(root, values=["English", "Русский", "Français", "한국어", "Español", "Português", "Polski", "中文", "日本語"], state="readonly")
     language_choice.current(0)  # English default
-    language_choice.grid(row=9, column=0, columnspan=4, pady=10)
+    language_choice.grid(row=11, column=0, columnspan=4, pady=10)
     language_choice.bind("<<ComboboxSelected>>", lambda event: update_text(
         "en" if language_choice.get() == "English" else
         "ru" if language_choice.get() == "Русский" else
